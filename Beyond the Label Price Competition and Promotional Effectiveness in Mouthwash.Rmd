@@ -1,0 +1,304 @@
+---
+title: "Beyond the Label Price Competition and Promotional Effectiveness in Mouthwash"
+author: "Jeff Clancy"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Setup
+
+## Packages
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+library(scales)
+```
+
+## Read in data
+
+```{r}
+transactions <- read_excel("dunnhumby - Breakfast at the Frat.xlsx", sheet = "dh Transaction Data", skip = 1)
+products <- read_excel("dunnhumby - Breakfast at the Frat.xlsx", sheet = "dh Products Lookup", skip = 1)
+```
+
+## Merge & Filter
+
+```{r}
+data <- merge(transactions, products, by = "UPC")
+data <- subset(data, CATEGORY == "ORAL HYGIENE PRODUCTS")
+data <- subset(data, DESCRIPTION != "COLG SPEARMINT WISP") # Removing this product as it is not mouthwash
+data$DESCRIPTION <- paste(data$DESCRIPTION, data$PRODUCT_SIZE, sep = " - ")
+
+head(data)
+```
+
+# EDA
+
+## Product Level Totals
+
+```{r}
+mw_total <- data %>%
+  group_by(MANUFACTURER, PRODUCT_SIZE, DESCRIPTION) %>%
+  summarize(Sales = sum(SPEND, na.rm = TRUE),
+            Units_Sold = sum(UNITS, na.rm = TRUE),
+            Base_Price = round(mean(BASE_PRICE, na.rm = TRUE), 2),
+            .groups = "drop") %>%
+  mutate(across(c(DESCRIPTION, PRODUCT_SIZE, MANUFACTURER), as.factor))
+
+print(mw_total)
+```
+
+## Plotting Sales by Brand
+
+```{r, fig.height=5, fig.width=8}
+ggplot(mw_total %>% arrange(desc(Sales)),
+       aes(x = reorder(DESCRIPTION, Sales), y = Sales, fill = MANUFACTURER)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0("$", round(Sales / 1000), "K")), 
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) paste0("$", round(x / 1000), "K"),
+    limits = c(0, 350000)  # Set y-axis max to $350K
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"  # keep legend on right
+  ) +
+  labs(
+    title = "Mouthwash Sales by Brand & Product", 
+    x = "Product", 
+    y = "Sales"
+  )
+```
+
+## Plotting Units by Brand
+
+```{r, fig.height=5, fig.width=8}
+ggplot(mw_total %>% arrange(desc(Units_Sold)),
+       aes(x = reorder(DESCRIPTION, Units_Sold), y = Units_Sold, fill = MANUFACTURER)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(Units_Sold / 1000, 1), "K")), hjust = -0.1, size = 3) +
+  coord_flip() +
+  theme_minimal() +
+  theme(panel.grid = element_blank()) +
+  labs(title = "Units Sold by Product", x = "Product", y = "Units Sold") +
+  ylim(0, max(mw_total$Units_Sold) * 1.1)
+```
+
+# Modeling
+
+## Setting up the data for modeling
+
+```{r}
+brand_lookup <- data %>% distinct(DESCRIPTION) %>% arrange(DESCRIPTION) %>% mutate(brand_id = row_number())
+data <- data %>% left_join(brand_lookup, by = "DESCRIPTION")
+
+wide_data <- data %>%
+  group_by(WEEK_END_DATE, brand_id) %>%
+  summarize(
+    MOVE = sum(UNITS, na.rm = TRUE),
+    LPRICE = log(mean(PRICE, na.rm = TRUE)),
+    FEATURE = max(FEATURE, na.rm = TRUE),
+    DISPLAY = max(DISPLAY, na.rm = TRUE),
+    TPR = max(TPR_ONLY, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = brand_id,
+    values_from = c(MOVE, LPRICE, FEATURE, DISPLAY, TPR),
+    names_sep = ""
+  )
+```
+
+## Log Log Model Using Sales with Backwards Selection
+
+```{r}
+sales_model <- function(brand_num, data = wide_data) {
+  move_var <- paste0("MOVE", brand_num)
+  price_var <- paste0("LPRICE", brand_num)
+  feature_var <- paste0("FEATURE", brand_num)
+  display_var <- paste0("DISPLAY", brand_num)
+  tpr_var <- paste0("TPR", brand_num)
+
+  df <- data %>%
+    filter(!is.na(.data[[move_var]]), .data[[move_var]] > 0) %>%
+    mutate(
+      log_sales = log(.data[[move_var]]),
+      log_price = .data[[price_var]],
+      feature = .data[[feature_var]],
+      display = .data[[display_var]],
+      tpr = .data[[tpr_var]]
+    )
+
+  for (i in 1:max(brand_lookup$brand_id)) {
+    if (i != brand_num) {
+      df[[paste0("log_price", i)]]  <- data[[paste0("LPRICE", i)]][match(rownames(df), rownames(data))]
+      df[[paste0("feature", i)]]    <- data[[paste0("FEATURE", i)]][match(rownames(df), rownames(data))]
+      df[[paste0("display", i)]]    <- data[[paste0("DISPLAY", i)]][match(rownames(df), rownames(data))]
+      df[[paste0("tpr", i)]]        <- data[[paste0("TPR", i)]][match(rownames(df), rownames(data))]
+    }
+  }
+
+  competitors <- setdiff(1:max(brand_lookup$brand_id), brand_num)
+  predictors <- c(
+    "log_price", "feature", "display", "tpr",
+    paste0("log_price", competitors),
+    paste0("feature", competitors),
+    paste0("display", competitors),
+    paste0("tpr", competitors)
+  )
+
+  df <- df %>% filter(if_all(all_of(predictors), ~ !is.na(.)))
+
+  model <- lm(
+    as.formula(paste("log_sales ~", paste(predictors, collapse = " + "))),
+    data = df
+  )
+
+  step_model <- tryCatch({
+    step(model, direction = "backward", trace = 0)
+  }, error = function(e) {
+    message("Stepwise failed for Brand ", brand_num, ": ", e$message)
+    model
+  })
+
+  tidy(step_model) %>%
+    mutate(
+      Brand = paste0("Brand ", brand_num),
+      r_squared = summary(step_model)$r.squared
+    )
+}
+
+all_brand_results <- purrr::map_dfr(1:max(brand_lookup$brand_id), sales_model)
+
+head(all_brand_results)
+```
+
+# Plotting Competitive Map
+
+## Setting up table with results for competitive map plot
+
+```{r}
+summary_table_sales <- all_brand_results %>%
+  mutate(term_type = case_when(
+    term == "log_price" ~ "own_price",
+    grepl("^log_price\\d", term) ~ "cross_price",
+    grepl("^feature\\d", term) | grepl("^display\\d", term) | grepl("^tpr\\d", term) ~ "cross_promo",
+    TRUE ~ "other"
+  )) %>%
+  group_by(Brand) %>%
+  summarize(
+    OwnPriceElasticity = if (any(term_type == "own_price")) estimate[term_type == "own_price"][1] else 0,
+    MaxCrossPriceEffect = if (any(term_type == "cross_price")) max(estimate[term_type == "cross_price"], na.rm = TRUE) else 0,
+    MaxpromoEffect = if (any(term_type == "cross_promo")) max(abs(estimate[term_type == "cross_promo"]), na.rm = TRUE) else 0,
+    R2 = max(r_squared, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(brand_lookup %>% mutate(Brand = paste0("Brand ", brand_id)), by = "Brand")
+
+print(summary_table_sales)
+```
+
+## Competitive Map Plot
+
+```{r, fig.height=6, fig.width=8}
+ggplot(summary_table_sales, aes(x = OwnPriceElasticity, y = MaxCrossPriceEffect, label = DESCRIPTION)) +
+  geom_point(aes(size = R2, color = MaxpromoEffect), alpha = 0.8) +
+  ggrepel::geom_text_repel(max.overlaps = 100, size = 3.5, box.padding = 0.5) +
+  scale_color_gradient2(low = "blue", mid = "gray", high = "red", midpoint = 0, name = "Promotion Sensitivity") +
+  scale_size_continuous(name = "Model R²") +
+  scale_x_continuous(
+    limits = c(-15, 15),
+    breaks = seq(-15, 15, by = 3)
+  ) +
+  labs(
+    title = "Mouthwash Category: Competitive Map",
+    x = "Own Price Elasticity",
+    y = "Cross-Price Elasticity"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+# Additional Tables for Insights
+
+## Creating elasticity matrixes for each type of predictor
+
+```{r}
+extract_effect_matrix <- function(all_results, brand_lookup, prefix) {
+  brand_names <- brand_lookup$DESCRIPTION
+  n_brands <- length(brand_names)
+  mat <- matrix(NA, nrow = n_brands, ncol = n_brands)
+  rownames(mat) <- brand_names  
+  colnames(mat) <- brand_names  
+
+  for (j in 1:n_brands) {
+    brand_results <- all_results %>% filter(Brand == paste0("Brand ", j)) 
+    own_val <- brand_results %>% filter(term == prefix) %>% pull(estimate)
+    mat[j, j] <- ifelse(length(own_val) == 1, own_val, 0)
+
+    for (i in setdiff(1:n_brands, j)) {
+      term_i <- paste0(prefix, i)
+      cross_val <- brand_results %>% filter(term == term_i) %>% pull(estimate)
+      mat[i, j] <- ifelse(length(cross_val) == 1, cross_val, 0)
+    }
+  }
+
+  round(as.data.frame(mat), 3)
+}
+
+price_matrix   <- extract_effect_matrix(all_brand_results, brand_lookup, "log_price")
+feature_matrix <- extract_effect_matrix(all_brand_results, brand_lookup, "feature")
+display_matrix <- extract_effect_matrix(all_brand_results, brand_lookup, "display")
+tpr_matrix     <- extract_effect_matrix(all_brand_results, brand_lookup, "tpr")
+
+# write.csv(price_matrix, "price_matrix.csv")
+# write.csv(feature_matrix, "feature_matrix.csv")
+# write.csv(display_matrix, "display_matrix.csv")
+# write.csv(tpr_matrix, "tpr_matrix.csv")
+```
+
+## Creating a long dataframe of each combination to evaluate all variables at once
+
+```{r}
+matrix_to_long <- function(effect_df, effect_name) {
+  effect_df %>%
+    rownames_to_column(var = "Responding_Brand") %>%
+    pivot_longer(-Responding_Brand, names_to = "Actioning_Brand", values_to = effect_name) %>%
+    select(Actioning_Brand, Responding_Brand, all_of(effect_name))
+}
+
+price_long   <- matrix_to_long(price_matrix, "Price_Effect")
+feature_long <- matrix_to_long(feature_matrix, "Feature_Effect")
+display_long <- matrix_to_long(display_matrix, "Display_Effect")
+tpr_long     <- matrix_to_long(tpr_matrix, "TPR_Effect")
+
+brand_names <- brand_lookup$DESCRIPTION
+full_combinations <- expand.grid(
+  Actioning_Brand = brand_names,
+  Responding_Brand = brand_names,
+  stringsAsFactors = FALSE
+)
+
+combined_effects_df <- full_combinations %>%
+  left_join(price_long,   by = c("Actioning_Brand", "Responding_Brand")) %>%
+  left_join(feature_long, by = c("Actioning_Brand", "Responding_Brand")) %>%
+  left_join(display_long, by = c("Actioning_Brand", "Responding_Brand")) %>%
+  left_join(tpr_long,     by = c("Actioning_Brand", "Responding_Brand")) %>%
+  mutate(across(ends_with("_Effect"), ~ replace_na(., 0)))
+
+# write.csv(combined_effects_df, "combined_effects_df.csv")
+```
